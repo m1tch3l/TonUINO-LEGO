@@ -4,3 +4,4 @@ Dies ist meine Firmware für das [TonUINO](https://www.voss.earth/tonuino/) Proj
 ## Änderungen zum Original Projekt
 * Nachtlichtfunktion 
 * Beschleunigungssensor für nächster oder vorheriger Track
+* neuer Modus: Einschlafmodus - Nur der erste Track wird gespielt 
