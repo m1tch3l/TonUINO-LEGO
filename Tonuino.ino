@@ -4,11 +4,17 @@
 #include <MFRC522.h>
 #include <SPI.h>
 #include <SoftwareSerial.h>
+#include <Wire.h>
+#ifdef __AVR__
+#include <avr/power.h>
+#endif
+
 
 // DFPlayer Mini
 SoftwareSerial mySoftwareSerial(2, 3); // RX, TX
 uint16_t numTracksInFolder;
 uint16_t currentTrack;
+uint8_t volume;
 
 // this object stores nfc tag data
 struct nfcTagObject {
@@ -18,6 +24,17 @@ struct nfcTagObject {
   uint8_t mode;
   uint8_t special;
 };
+
+// ADXL345 (Beschleunigungssensor)
+#define DEVICE (0x53) // Device address as specified in data sheet
+byte _buff[6];
+char POWER_CTL = 0x2D;    //Power Control Register
+char DATA_FORMAT = 0x31;
+char DATAX0 = 0x32;    //X-Axis Data 0 (0x32) - Z-Axis Data 1 (0x37)
+bool show_Accel = false; // Zeige die Beschleunigung in der Console (false: Nein; true: Ja)
+int x_axis, y_axis, z_axis, y_axis_init;
+bool nextTrackReleased = false;
+bool nextTrackFlag = false;
 
 nfcTagObject myCard;
 
@@ -115,11 +132,23 @@ static void nextTrack(uint16_t track) {
       mp3.playFolderTrack(myCard.folder, currentTrack);
       // Fortschritt im EEPROM abspeichern
       EEPROM.write(myCard.folder, currentTrack);
-    } else {
+    } 
+    else {
 //      mp3.sleep();  // Je nach Modul kommt es nicht mehr zurück aus dem Sleep!
       // Fortschritt zurück setzen
       EEPROM.write(myCard.folder, 1);
     }
+  }
+  if (myCard.mode == 6) {
+    if ((currentTrack != numTracksInFolder) && (nextTrackFlag == true)) {
+      currentTrack = currentTrack + 1;
+      mp3.playFolderTrack(myCard.folder, currentTrack);
+      Serial.print(F("Einschlafmodus ist aktiv -> ein Track wird gespielt, ja"));
+      Serial.print(currentTrack);
+      nextTrackFlag = false;
+    } else 
+//      mp3.sleep();   // Je nach Modul kommt es nicht mehr zurück aus dem Sleep!
+    { }
   }
 }
 
@@ -153,6 +182,13 @@ static void previousTrack() {
     // Fortschritt im EEPROM abspeichern
     EEPROM.write(myCard.folder, currentTrack);
   }
+  if (myCard.mode == 6) {
+    Serial.println(F("Einschlafmodus ist aktiv -> vorheriger Track"));
+    if (currentTrack != 1) {
+      currentTrack = currentTrack - 1;
+    }
+    mp3.playFolderTrack(myCard.folder, currentTrack);
+  }
 }
 
 // MFRC522
@@ -169,6 +205,7 @@ MFRC522::StatusCode status;
 #define buttonPause A0
 #define buttonUp A1
 #define buttonDown A2
+
 #define busyPin 4
 
 #define LONG_PRESS 1000
@@ -185,19 +222,30 @@ uint8_t numberOfCards = 0;
 bool isPlaying() { return !digitalRead(busyPin); }
 
 void setup() {
-
+  Wire.begin(); // join i2c bus (for accerleration)
+  //Put the ADXL345 into Measurement Mode by writing 0x08 to the POWER_CTL register.
+  writeTo(POWER_CTL, 0x08);
   Serial.begin(115200); // Es gibt ein paar Debug Ausgaben über die serielle
                         // Schnittstelle
   randomSeed(analogRead(A0)); // Zufallsgenerator initialisieren
 
-  Serial.println(F("TonUINO Version 2.0"));
-  Serial.println(F("(c) Thorsten Voß"));
+  Serial.println(F("TonUINO-LEGO Version 2.0.1"));
+  Serial.println(F("(c) Michael Grelcke"));
+  Serial.println();
+  Serial.println(F("Original: https://www.voss.earth/tonuino by Thorsten Voß"));
 
   // Knöpfe mit PullUp
   pinMode(buttonPause, INPUT_PULLUP);
   pinMode(buttonUp, INPUT_PULLUP);
   pinMode(buttonDown, INPUT_PULLUP);
 
+  pinMode(5, OUTPUT); //LEDs
+  digitalWrite(5, LOW);
+
+  // Beschleunigungssensor kalibrieren
+  readAccel();
+  y_axis_init = y_axis;
+  
   // Busy Pin
   pinMode(busyPin, INPUT);
 
@@ -226,14 +274,15 @@ void setup() {
 
 }
 
-void loop() {
-  do {
+void loop(){
+    do {
     mp3.loop();
     // Buttons werden nun über JS_Button gehandelt, dadurch kann jede Taste
     // doppelt belegt werden
     pauseButton.read();
     upButton.read();
     downButton.read();
+    readAccel(); // read the x/y/z tilt
 
     if (pauseButton.wasReleased()) {
       if (ignorePauseButton == false) {
@@ -259,14 +308,19 @@ void loop() {
     }
 
     if (upButton.pressedFor(LONG_PRESS)) {
-      Serial.println(F("Volume Up"));
-      mp3.increaseVolume();
+      volume = mp3.getVolume();
+      if (volume < 18)
+        mp3.increaseVolume();
+      Serial.print("Volume Up: ");
+      Serial.println(volume);
       ignoreUpButton = true;
     } else if (upButton.wasReleased()) {
-      if (!ignoreUpButton)
-        nextTrack(random(65536));
-      else
-        ignoreUpButton = false;
+      volume = mp3.getVolume();
+      if (volume < 18)
+        mp3.increaseVolume();
+      Serial.print("Volume Up: ");
+      Serial.println(volume);
+      ignoreUpButton = true;
     }
 
     if (downButton.pressedFor(LONG_PRESS)) {
@@ -274,12 +328,26 @@ void loop() {
       mp3.decreaseVolume();
       ignoreDownButton = true;
     } else if (downButton.wasReleased()) {
-      if (!ignoreDownButton)
-        previousTrack();
-      else
-        ignoreDownButton = false;
+      Serial.println(F("Volume Down"));
+      mp3.decreaseVolume();
+      ignoreDownButton = true;
     }
     // Ende der Buttons
+
+    if (nextTrackReleased) {
+      if (y_axis_init - y_axis > 100) {
+        nextTrackFlag = true;
+        nextTrack(random(65536));
+        Serial.println("Next Track");
+        nextTrackReleased = false;
+      } else if (y_axis_init - y_axis < -100) {
+        previousTrack();
+        Serial.println("Previous Track");
+        nextTrackReleased = false;
+      }
+    }
+     
+    
   } while (!mfrc522.PICC_IsNewCardPresent());
 
   // RFID Karte wurde aufgelegt
@@ -331,8 +399,14 @@ void loop() {
         currentTrack = EEPROM.read(myCard.folder);
         mp3.playFolderTrack(myCard.folder, currentTrack);
       }
+      // Einschlaf Modus: Eine Datei abspielen
+      if (myCard.mode == 6) {
+        Serial.println(F("Einschlafmodus ist aktiv -> ein Track wird gespielt"));
+        currentTrack = 1;
+        mp3.playFolderTrack(myCard.folder, currentTrack);
+      }
     }
-
+  
     // Neue Karte konfigurieren
     else {
       knownCard = false;
@@ -464,7 +538,7 @@ void setupCard() {
                                true, myCard.folder);
 
   // Admin Funktionen
-  if (myCard.mode == 6)
+  if (myCard.mode == 7)
     myCard.special = voiceMenu(3, 320, 320);
 
   // Karte ist konfiguriert -> speichern
@@ -584,4 +658,46 @@ void dump_byte_array(byte *buffer, byte bufferSize) {
     Serial.print(buffer[i] < 0x10 ? " 0" : " ");
     Serial.print(buffer[i], HEX);
   }
+}
+
+void readAccel() {
+  readFrom( DATAX0, 6, _buff); //read the acceleration data from the ADXL345
+  // each axis reading comes in 10 bit resolution, ie 2 bytes. Least Significat Byte first!!
+  // thus we are converting both bytes in to one int
+  x_axis = (((int)_buff[1]) << 8) | _buff[0];
+  y_axis = (((int)_buff[3]) << 8) | _buff[2];
+  z_axis = (((int)_buff[5]) << 8) | _buff[4];
+  if (show_Accel == true){
+    Serial.print("x: ");
+    Serial.print( x_axis );
+    Serial.print(" y: ");
+    Serial.print( y_axis );
+    Serial.print(" z: ");
+    Serial.println( z_axis );
+  }
+  
+  if (((y_axis) < (y_axis_init + 10)) and ((y_axis) > (y_axis_init - 10)))
+    nextTrackReleased = true;
+}
+  
+// Reads num bytes starting from address register on device in to _buff array
+void readFrom(byte address, int num, byte _buff[]) {
+  Wire.beginTransmission(DEVICE); // start transmission to device
+  Wire.write(address); // sends address to read from
+  Wire.endTransmission(); // end transmission
+  Wire.beginTransmission(DEVICE); // start transmission to device
+  Wire.requestFrom(DEVICE, num); // request 6 bytes from device
+  int i = 0;
+  while(Wire.available()) {// device may send less than requested (abnormal)
+    _buff[i] = Wire.read(); // receive a byte
+    i++;
+    }
+  Wire.endTransmission(); // end transmission
+}
+
+void writeTo(byte address, byte val) {
+  Wire.beginTransmission(DEVICE); // start transmission to device
+  Wire.write(address); // send register address
+  Wire.write(val); // send value to write
+  Wire.endTransmission(); // end transmission
 }
